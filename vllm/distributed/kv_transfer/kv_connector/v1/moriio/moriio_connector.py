@@ -1206,8 +1206,6 @@ class MoRIIOConnectorWorker:
 
         self.load_ready_flag: dict[str, bool] = {}
         self.write_ready_flags: dict[str, bool] = {}
-        self.kv_cache_shape = None
-        self.block_shape = None
         self.kv_element_size = 0
         self.kv_cache_shapes: dict[str, torch.Size] = {}
         self.block_lens: dict[str, int] = {}
@@ -1676,14 +1674,11 @@ class MoRIIOConnectorWorker:
     def _is_mla_cache_layer(self, layer_name: str) -> bool:
         return is_mla_cache_layer(self.layer_to_spec, layer_name)
 
-    def _get_layer_transfer_geometry(
-        self, layer_name: str, remote_num_blocks: int | None = None
-    ) -> LayerTransferGeometry:
+    def _get_layer_transfer_geometry(self, layer_name: str) -> LayerTransferGeometry:
         return get_layer_transfer_geometry(
             layer_name,
             self.kv_caches[layer_name],
             self.layer_to_spec,
-            remote_num_blocks,
         )
 
     def _iter_layer_registration_regions(
@@ -1703,31 +1698,10 @@ class MoRIIOConnectorWorker:
             layer_name: kv_cache.shape for layer_name, kv_cache in kv_caches.items()
         }
 
-        first_layer_name, first_kv_cache = next(
-            (
-                (layer_name, kv_cache)
-                for layer_name, kv_cache in kv_caches.items()
-                if (
-                    not self._is_mla_cache_layer(layer_name)
-                    and len(kv_cache.shape) == 5
-                    and (kv_cache.shape[0] == 2 or kv_cache.shape[1] == 2)
-                )
-            ),
-            next(iter(kv_caches.items())),
-        )
+        first_layer_name, first_kv_cache = next(iter(kv_caches.items()))
         kv_elem_size = first_kv_cache.element_size()
 
-        use_mla = self._is_mla_cache_layer(first_layer_name)
         first_geometry = self._get_layer_transfer_geometry(first_layer_name)
-
-        if use_mla:
-            # MLA case.
-            block_rank = 2  # [block_size, latent_dim]
-            block_shape = first_kv_cache.shape[-block_rank:]
-        else:
-            # [2, num_blocks, ...] or [num_blocks, 2, ...]
-            block_rank = 3  # [block_size, kv_heads, head_dim]
-            block_shape = first_kv_cache.shape[-block_rank:]
         self.num_blocks = first_geometry.num_blocks
         self.slot_size_bytes = first_geometry.slot_size_bytes
         if first_geometry.block_size != self.block_size:
@@ -1747,8 +1721,6 @@ class MoRIIOConnectorWorker:
         # hybrid attn, etc
         # block size in bytes
         self.block_len = first_geometry.block_len
-        self.kv_cache_shape = first_kv_cache.shape
-        self.block_shape = block_shape
         self.kv_element_size = kv_elem_size
 
         self.dst_num_blocks[self.engine_id] = self.num_blocks
@@ -2515,7 +2487,6 @@ class MoRIIOConnectorWorker:
             layer_to_spec=self.layer_to_spec,
             local_block_ids=local_block_ids,
             remote_block_ids=remote_block_ids,
-            remote_num_blocks=remote_moriio_meta.num_blocks,
             merge_fn=lambda local, remote, sizes: self.merge_contiguous_blocks(
                 local, remote, sizes, assume_sorted=False
             ),

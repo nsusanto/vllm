@@ -19,7 +19,6 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
-aiter_available = importlib.util.find_spec("aiter") is not None
 mori_available = importlib.util.find_spec("mori") is not None
 
 if not (current_platform.is_rocm() and mori_available):
@@ -66,6 +65,28 @@ def _mla_spec(block_size: int = 4) -> MLAAttentionSpec:
         num_kv_heads=1,
         head_size=3,
         dtype=torch.bfloat16,
+    )
+
+
+def _cache_views(
+    spec: FullAttentionSpec | MLAAttentionSpec,
+    *,
+    num_blocks: int = 8,
+    num_layers: int = 1,
+    layout: KVCacheLayout = KVCacheLayout.LBNHC,
+    kernel_block_size: int | None = None,
+) -> list[torch.Tensor]:
+    raw = torch.empty(
+        num_blocks * num_layers * spec.page_size_bytes,
+        dtype=torch.int8,
+    )
+    return dense_kv_cache_views(
+        raw,
+        spec,
+        num_blocks,
+        num_layers,
+        layout,
+        kernel_block_size=kernel_block_size,
     )
 
 
@@ -123,151 +144,42 @@ def _write_task(layer_name: str, transfer_id: str = "xfer") -> Any:
 
 
 @pytest.mark.parametrize(
-    ("shape", "spec", "remote_num_blocks", "expected_geometry", "expected_offsets"),
+    ("spec", "expected_geometry", "expected_offsets"),
     [
         pytest.param(
-            (2, 8, 4, 2, 3),
             _full_spec(),
-            16,
-            {
-                "block_stride": 24,
-                "local_kv_stride": 192,
-                "remote_kv_stride": 384,
-                "split_kv_regions": True,
-            },
-            ([48, 144, 432, 528], [192, 240, 960, 1008], [48, 48, 48, 48]),
-            id="separated",
-        ),
-        pytest.param(
-            (8, 2, 4, 2, 3),
-            _full_spec(),
-            16,
-            {
-                "block_stride": 48,
-                "local_kv_stride": 24,
-                "remote_kv_stride": 24,
-                "split_kv_regions": False,
-            },
-            ([96, 288], [384, 480], [96, 96]),
-            id="interleaved",
-        ),
-        pytest.param(
-            (2, 8, 2, 4, 3),
-            _full_spec(),
-            16,
-            {
-                "block_size": 4,
-                "block_stride": 24,
-                "local_kv_stride": 192,
-                "remote_kv_stride": 384,
-                "split_kv_regions": True,
-            },
-            ([48, 144, 432, 528], [192, 240, 960, 1008], [48, 48, 48, 48]),
-            id="shuffled-separated",
-        ),
-        pytest.param(
-            (8, 2, 2, 4, 3),
-            _full_spec(),
-            16,
-            {
-                "block_size": 4,
-                "block_stride": 48,
-                "local_kv_stride": 24,
-                "remote_kv_stride": 24,
-                "split_kv_regions": False,
-            },
-            ([96, 288], [384, 480], [96, 96]),
-            id="shuffled-interleaved",
-        ),
-        pytest.param(
-            (2, 16, 2, 2, 3),
-            _full_spec(),
-            16,
             {
                 "num_blocks": 8,
                 "block_size": 4,
-                "block_stride": 24,
-                "local_kv_stride": 192,
-                "remote_kv_stride": 384,
-                "split_kv_regions": True,
-            },
-            ([48, 144, 432, 528], [192, 240, 960, 1008], [48, 48, 48, 48]),
-            id="separated-kernel-blocks",
-        ),
-        pytest.param(
-            (16, 2, 2, 2, 3),
-            _full_spec(),
-            16,
-            {
-                "num_blocks": 8,
-                "block_size": 4,
+                "block_len": 96,
+                "slot_size_bytes": 24,
                 "block_stride": 48,
-                "local_kv_stride": None,
-                "remote_kv_stride": None,
-                "transfers_per_block": 1,
             },
             ([96, 288], [384, 480], [96, 96]),
-            id="interleaved-kernel-blocks",
+            id="full-attention",
         ),
         pytest.param(
-            (2, 32, 8, 2, 3),
-            _full_spec(block_size=16, num_kv_heads=8),
-            8,
-            {
-                "num_blocks": 4,
-                "block_size": 16,
-                "block_len": 768,
-                "block_stride": 384,
-                "local_kv_stride": 1536,
-                "remote_kv_stride": 3072,
-                "split_kv_regions": True,
-            },
-            (
-                [768, 2304, 3840, 5376],
-                [3072, 3840, 9216, 9984],
-                [768, 768, 768, 768],
-            ),
-            id="separated-kernel-axis-from-spec",
-        ),
-        pytest.param(
-            (32, 2, 8, 2, 3),
-            _full_spec(block_size=16, num_kv_heads=8),
-            8,
-            {
-                "num_blocks": 4,
-                "block_size": 16,
-                "block_len": 1536,
-                "block_stride": 768,
-                "local_kv_stride": None,
-                "remote_kv_stride": None,
-                "transfers_per_block": 1,
-            },
-            ([1536, 4608], [6144, 7680], [1536, 1536]),
-            id="interleaved-kernel-axis-from-spec",
-        ),
-        pytest.param(
-            (8, 1, 4, 3),
             _mla_spec(),
-            16,
             {
+                "num_blocks": 8,
+                "block_size": 4,
+                "block_len": 24,
+                "slot_size_bytes": 6,
                 "block_stride": 12,
-                "local_kv_stride": None,
-                "remote_kv_stride": None,
-                "transfers_per_block": 1,
             },
             ([24, 72], [96, 120], [24, 24]),
-            id="mla-key-only",
+            id="mla",
         ),
     ],
 )
-def test_supported_layouts_compute_expected_geometry_and_offsets(
-    shape, spec, remote_num_blocks, expected_geometry, expected_offsets
+def test_standardized_caches_compute_expected_geometry_and_offsets(
+    spec, expected_geometry, expected_offsets
 ):
-    cache = torch.empty(shape, dtype=torch.bfloat16)
+    (cache,) = _cache_views(spec)
     worker = _worker({"layer": cache}, {"layer": spec})
 
     geometry = moriio_layout.get_layer_transfer_geometry(
-        "layer", cache, worker.layer_to_spec, remote_num_blocks=remote_num_blocks
+        "layer", cache, worker.layer_to_spec
     )
     for field, expected in expected_geometry.items():
         assert getattr(geometry, field) == expected
@@ -279,75 +191,81 @@ def test_supported_layouts_compute_expected_geometry_and_offsets(
             worker.layer_to_spec,
             [1, 3],
             [4, 5],
-            remote_num_blocks,
         )
         == expected_offsets
     )
 
 
-def test_kernel_block_layout_without_spec_dimensions_rejects_ambiguous_axes():
-    cache = torch.empty((2, 32, 8, 2, 3), dtype=torch.bfloat16)
-    worker = _worker(
-        {"layer": cache},
-        {"layer": SimpleNamespace(block_size=16)},
+def test_block_interleaved_cache_uses_strided_offsets():
+    spec = _full_spec()
+    _, cache = _cache_views(
+        spec,
+        num_layers=2,
+        layout=KVCacheLayout.BLNHC,
     )
+    layer_to_spec = {"layer": spec}
 
-    with pytest.raises(ValueError, match="Ambiguous MoRIIO kernel-block"):
-        moriio_layout.get_layer_transfer_geometry(
-            "layer", cache, worker.layer_to_spec, remote_num_blocks=8
-        )
+    geometry = moriio_layout.get_layer_transfer_geometry("layer", cache, layer_to_spec)
+
+    assert geometry.block_stride * cache.element_size() == 192
+    assert moriio_layout.compute_block_transfer_offsets(
+        "layer", cache, layer_to_spec, [1, 3], [4, 5]
+    ) == ([192, 576], [768, 960], [96, 96])
 
 
 def test_mixed_layers_compute_distinct_offsets_per_layer():
+    full_spec = _full_spec()
+    mla_spec = _mla_spec()
     kv_caches = {
-        "separated": torch.empty((2, 8, 4, 2, 3), dtype=torch.bfloat16),
-        "interleaved": torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16),
-        "indexer": torch.empty((8, 1, 4, 3), dtype=torch.bfloat16),
+        "layer_compact": _cache_views(full_spec)[0],
+        "block_interleaved": _cache_views(
+            full_spec,
+            num_layers=2,
+            layout=KVCacheLayout.BLNHC,
+        )[1],
+        "mla": _cache_views(mla_spec)[0],
     }
     worker = _worker(
         kv_caches,
         {
-            "separated": _full_spec(),
-            "interleaved": _full_spec(),
-            "indexer": _mla_spec(),
+            "layer_compact": full_spec,
+            "block_interleaved": full_spec,
+            "mla": mla_spec,
         },
     )
 
-    separated = moriio_layout.compute_block_transfer_offsets(
-        "separated",
-        kv_caches["separated"],
+    layer_compact = moriio_layout.compute_block_transfer_offsets(
+        "layer_compact",
+        kv_caches["layer_compact"],
         worker.layer_to_spec,
         [1, 3],
         [4, 5],
-        _remote_meta().num_blocks,
     )
-    interleaved = moriio_layout.compute_block_transfer_offsets(
-        "interleaved",
-        kv_caches["interleaved"],
+    block_interleaved = moriio_layout.compute_block_transfer_offsets(
+        "block_interleaved",
+        kv_caches["block_interleaved"],
         worker.layer_to_spec,
         [1, 3],
         [4, 5],
-        _remote_meta().num_blocks,
     )
-    indexer = moriio_layout.compute_block_transfer_offsets(
-        "indexer",
-        kv_caches["indexer"],
+    mla = moriio_layout.compute_block_transfer_offsets(
+        "mla",
+        kv_caches["mla"],
         worker.layer_to_spec,
         [1, 3],
         [4, 5],
-        _remote_meta().num_blocks,
     )
 
-    assert separated != interleaved
-    assert separated != indexer
-    assert interleaved != indexer
+    assert layer_compact != block_interleaved
+    assert layer_compact != mla
+    assert block_interleaved != mla
 
 
 def test_write_transfer_plan_caches_offsets_per_geometry():
     kv_caches = {
-        "dense0": torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16),
-        "dense1": torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16),
-        "indexer": torch.empty((8, 1, 4, 3), dtype=torch.bfloat16),
+        "dense0": _cache_views(_full_spec())[0],
+        "dense1": _cache_views(_full_spec())[0],
+        "indexer": _cache_views(_mla_spec())[0],
     }
     calls: list[str] = []
 
@@ -676,77 +594,81 @@ def test_moriio_wrapper_rejects_invalid_messages(role, payload, match):
 
 
 def test_local_block_ids_longer_than_remote_raises_value_error():
-    cache = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()})
+    spec = _full_spec()
+    (cache,) = _cache_views(spec)
+    worker = _worker({"layer": cache}, {"layer": spec})
 
     with pytest.raises(ValueError, match="longer than remote_block_ids"):
         moriio_layout.compute_block_transfer_offsets(
-            "layer", cache, worker.layer_to_spec, [1, 3], [4], _remote_meta().num_blocks
+            "layer", cache, worker.layer_to_spec, [1, 3], [4]
         )
 
 
 def test_empty_local_block_ids_is_free_only_noop():
-    cache = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()})
+    spec = _full_spec()
+    (cache,) = _cache_views(spec)
+    worker = _worker({"layer": cache}, {"layer": spec})
 
     assert moriio_layout.compute_block_transfer_offsets(
-        "layer", cache, worker.layer_to_spec, [], [4, 5], _remote_meta().num_blocks
+        "layer", cache, worker.layer_to_spec, [], [4, 5]
     ) == ([], [], [])
 
 
-def test_registration_regions_do_not_split_interleaved_or_mla_cache():
-    separated = torch.empty((2, 8, 4, 2, 3), dtype=torch.bfloat16)
-    interleaved = torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16)
-    indexer = torch.empty((8, 1, 4, 3), dtype=torch.bfloat16)
+def test_registration_regions_cover_each_standardized_layer_span():
+    full_spec = _full_spec()
+    mla_spec = _mla_spec()
+    layer_compact = _cache_views(full_spec)[0]
+    block_interleaved = _cache_views(
+        full_spec,
+        num_layers=2,
+        layout=KVCacheLayout.BLNHC,
+    )[1]
+    mla = _cache_views(mla_spec)[0]
     worker = _worker(
         {
-            "separated": separated,
-            "interleaved": interleaved,
-            "indexer": indexer,
+            "layer_compact": layer_compact,
+            "block_interleaved": block_interleaved,
+            "mla": mla,
         },
         {
-            "separated": _full_spec(),
-            "interleaved": _full_spec(),
-            "indexer": _mla_spec(),
+            "layer_compact": full_spec,
+            "block_interleaved": full_spec,
+            "mla": mla_spec,
         },
     )
 
-    separated_regions = moriio_layout.iter_layer_registration_regions(
-        "separated", separated, worker.layer_to_spec
+    layer_compact_regions = moriio_layout.iter_layer_registration_regions(
+        "layer_compact", layer_compact, worker.layer_to_spec
     )
-    interleaved_regions = moriio_layout.iter_layer_registration_regions(
-        "interleaved", interleaved, worker.layer_to_spec
+    block_interleaved_regions = moriio_layout.iter_layer_registration_regions(
+        "block_interleaved", block_interleaved, worker.layer_to_spec
     )
-    indexer_regions = moriio_layout.iter_layer_registration_regions(
-        "indexer", indexer, worker.layer_to_spec
+    mla_regions = moriio_layout.iter_layer_registration_regions(
+        "mla", mla, worker.layer_to_spec
     )
 
-    assert [region[0].data_ptr() for region in separated_regions] == [
-        separated[0].data_ptr(),
-        separated[1].data_ptr(),
-    ]
-    assert separated_regions[0][1] == 8 * 48
-    assert separated_regions[1][1] == 8 * 48
-
-    assert len(interleaved_regions) == 1
-    assert interleaved_regions[0][0].data_ptr() == interleaved.data_ptr()
-    assert interleaved_regions[0][1] == 8 * 2 * 48
-
-    assert len(indexer_regions) == 1
-    assert indexer_regions[0][0].data_ptr() == indexer.data_ptr()
-    assert indexer_regions[0][1] == 8 * 24
+    assert len(layer_compact_regions) == 1
+    assert layer_compact_regions[0][0] is layer_compact
+    assert layer_compact_regions[0][1] == 8 * 96
+    assert len(block_interleaved_regions) == 1
+    assert block_interleaved_regions[0][0] is block_interleaved
+    assert block_interleaved_regions[0][1] == 7 * 192 + 96
+    assert len(mla_regions) == 1
+    assert mla_regions[0][0] is mla
+    assert mla_regions[0][1] == 8 * 24
 
 
 def test_registration_regions_use_layer_num_blocks():
-    cache = torch.empty((4, 2, 4, 2, 3), dtype=torch.bfloat16)
-    worker = _worker({"layer": cache}, {"layer": _full_spec()}, num_blocks=8)
+    spec = _full_spec()
+    (cache,) = _cache_views(spec, num_blocks=4)
+    worker = _worker({"layer": cache}, {"layer": spec}, num_blocks=8)
 
     regions = moriio_layout.iter_layer_registration_regions(
         "layer", cache, worker.layer_to_spec
     )
 
     assert len(regions) == 1
-    assert regions[0][1] == 4 * 2 * 48
+    assert regions[0][1] == 4 * spec.page_size_bytes
 
 
 def test_unsupported_shape_raises_value_error():
@@ -755,8 +677,16 @@ def test_unsupported_shape_raises_value_error():
     cache = torch.empty((8, 3, 5, 7), dtype=torch.bfloat16)
     worker = _worker({"layer": cache}, {"layer": _full_spec()})
 
-    with pytest.raises(ValueError, match="Unsupported MoRIIO K/V cache shape"):
+    with pytest.raises(ValueError, match="Unsupported MoRIIO cache shape or strides"):
         moriio_layout.get_layer_transfer_geometry("layer", cache, worker.layer_to_spec)
+
+
+def test_non_block_dense_layout_raises_value_error():
+    spec = _full_spec()
+    (cache,) = _cache_views(spec, layout=KVCacheLayout.LHBNC)
+
+    with pytest.raises(ValueError, match="Unsupported MoRIIO cache shape or strides"):
+        moriio_layout.get_layer_transfer_geometry("layer", cache, {"layer": spec})
 
 
 def test_standardized_view_geometry_and_padded_registration():
